@@ -6,6 +6,11 @@ import { join } from "node:path";
 import { DEFAULT_CONFIG } from "../extensions/config/config.js";
 import { recallForContext } from "../extensions/lifecycle/recall.js";
 import { createRecallTurnPolicy } from "../extensions/lifecycle/memory-lifecycle-recall.js";
+import {
+  emitRetrieval,
+  telemetryEvent,
+  type RetrievalTelemetry,
+} from "../extensions/lifecycle/retrieval-telemetry.js";
 import { createRecallOperations } from "../extensions/operations/memory-recall-operations.js";
 const dirs: string[] = [];
 afterEach(() => {
@@ -29,8 +34,8 @@ function fixture() {
   const recall = vi.fn(async (_bank: string, _query: string, _options: unknown) => ({ results }));
   const client = { recall } as never;
   const messages = [{ role: "user" as const, content: "exact request", timestamp: 1 }];
-  const events: any[] = [];
-  const observer = (event: any) => {
+  const events: RetrievalTelemetry[] = [];
+  const observer = (event: RetrievalTelemetry) => {
     events.push(event);
   };
   return { cwd, config, results, recall, client, messages, events, observer };
@@ -65,8 +70,9 @@ it("records exact scope query/filter/raw, quality-kept and topK IDs without chan
     rawCount: 4,
     keptCount: 3,
     injectedCount: 1,
-    results: f.results,
+    results: [{ id: "a", tags: ["x"] }, { id: "dup" }, { id: "c" }],
   });
+  expect(JSON.stringify(f.events[0])).not.toContain("alpha");
   expect(
     await recallForContext({
       ...args,
@@ -104,23 +110,29 @@ it("cache hits emit bank events with origins, linked injection hashes and no ext
   const hits = f.events.filter((e) => e.phase === "retrieval");
   expect(hits.map((e) => e.cacheOriginId)).toEqual(original.map((e) => e.retrievalId));
   expect(hits.every((e) => e.cache === "hit")).toBe(true);
-  const rendered = cached!.messages.find((m) => (m as any).content !== "exact request") as any;
+  const rendered = cached!.messages.find(
+    (m) => (m as { content?: unknown }).content !== "exact request",
+  ) as { content?: unknown; role?: string; timestamp?: number } | undefined;
   const injection = f.events.find((e) => e.phase === "injection");
+  expect(rendered).toBeDefined();
+  expect(typeof rendered?.content).toBe("string");
   expect(injection).toMatchObject({
     injected: true,
     status: "success",
-    renderedHash: createHash("sha256").update(rendered.content).digest("hex"),
-    renderedLength: rendered.content.length,
+    renderedHash: createHash("sha256").update(String(rendered?.content)).digest("hex"),
+    renderedLength: String(rendered?.content).length,
     retrievalIds: hits.map((e) => e.retrievalId),
   });
-  expect(hits.every((e) => e.contextId === injection.contextId)).toBe(true);
-  expect(Object.keys(rendered).sort()).toEqual(["content", "role", "timestamp"]);
-  expect((patch!.messages[0] as any).content).toEqual((cached!.messages[0] as any).content);
+  expect(hits.every((e) => e.contextId === injection?.contextId)).toBe(true);
+  expect(Object.keys(rendered ?? {}).sort()).toEqual(["content", "role", "timestamp"]);
+  expect((patch!.messages[0] as { content?: unknown }).content).toEqual(
+    (cached!.messages[0] as { content?: unknown }).content,
+  );
 });
 it("reports outer scope timeout once even if HTTP later succeeds, plus error and empty", async () => {
   const f = fixture();
   f.config.recall.timeoutMs = 5;
-  let resolve!: (value: any) => void;
+  let resolve!: (value: unknown) => void;
   const client = {
     recall: vi
       .fn()
@@ -165,13 +177,33 @@ it("explicit recall records resolved options/results and rethrows same original 
     query: "explicit exact",
     cache: "none",
     rawIds: ["a", "dup", "c"],
-    results: f.results,
+    results: [{ id: "a", tags: ["x"] }, { id: "dup" }, { id: "c" }],
   });
-  expect(event.filters).toEqual(f.recall.mock.calls[0]![2]);
+  expect(event?.filters).toEqual(f.recall.mock.calls[0]![2]);
   const error = new Error("original");
   f.recall.mockRejectedValueOnce(error as never);
   await expect(ops.recall(f.cwd, "failure")).rejects.toBe(error);
-  expect(f.events[1].status).toBe("error");
+  expect(f.events[1]?.status).toBe("error");
+});
+it("redacts secrets in query and never emits recalled text", () => {
+  const events: RetrievalTelemetry[] = [];
+  emitRetrieval(
+    (event) => {
+      events.push(event);
+    },
+    () =>
+      telemetryEvent(Date.now(), {
+        phase: "retrieval",
+        mode: "explicit",
+        cache: "none",
+        status: "success",
+        query: "token sk-abcdefghijklmnopqrstuv",
+        results: [{ id: "a", text: "secret memory" }] as never,
+      }),
+  );
+  expect(events[0]?.query).toContain("[REDACTED_API_KEY]");
+  expect(JSON.stringify(events[0])).not.toContain("secret memory");
+  expect(JSON.stringify(events[0])).not.toContain("sk-abcdefghijklmnopqrstuv");
 });
 it("distinguishes skipped and empty injection and isolates throwing observer", async () => {
   const f = fixture();

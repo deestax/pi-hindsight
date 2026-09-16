@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { redactError } from "../utils/sanitize.js";
+import { redactError, redactSecrets } from "../utils/sanitize.js";
 import type { RecallResultItem } from "../types.js";
+
+export interface RetrievalResultRef {
+  id?: string;
+  tags?: string[];
+}
 
 export interface RetrievalTelemetry {
   version: 1;
@@ -24,7 +29,7 @@ export interface RetrievalTelemetry {
   rawCount?: number;
   keptCount?: number;
   injectedCount?: number;
-  results?: { id?: string; text?: string; tags?: string[] }[];
+  results?: RetrievalResultRef[];
   error?: string;
   renderedHash?: string;
   renderedLength?: number;
@@ -34,6 +39,18 @@ export interface RetrievalTelemetry {
 }
 export type RetrievalObserver = (event: RetrievalTelemetry) => void | Promise<void>;
 
+function sanitizeTelemetry(event: RetrievalTelemetry): RetrievalTelemetry {
+  const next: RetrievalTelemetry = { ...event };
+  if (typeof next.query === "string") next.query = redactSecrets(next.query);
+  if (Array.isArray(next.results)) {
+    next.results = next.results.map((item) => {
+      const { text: _text, ...rest } = item as RetrievalResultRef & { text?: string };
+      return rest;
+    });
+  }
+  return next;
+}
+
 // Never await exporters, expose mutable recall data, or allow observer failures
 // (including rejected promises and payload projection failures) into memory policy.
 export function emitRetrieval(
@@ -42,7 +59,7 @@ export function emitRetrieval(
 ): void {
   if (!observer) return;
   try {
-    const pending = observer(structuredClone(build()));
+    const pending = observer(sanitizeTelemetry(structuredClone(build())));
     if (pending) void Promise.resolve(pending).catch(() => {});
   } catch {
     /* telemetry is best effort */
@@ -73,13 +90,13 @@ export function resultTelemetry(items: RecallResultItem[]) {
   return {
     rawCount: items.length,
     rawIds: resultIds(items),
-    results: items.map((item) => ({
-      ...(typeof item.id === "string" ? { id: item.id } : {}),
-      ...(typeof (item.text ?? item.content) === "string"
-        ? { text: item.text ?? item.content }
-        : {}),
-      ...(Array.isArray(item.tags) ? { tags: item.tags } : {}),
-    })),
+    results: items.flatMap((item) => {
+      const row: RetrievalResultRef = {
+        ...(typeof item.id === "string" ? { id: item.id } : {}),
+        ...(Array.isArray(item.tags) ? { tags: item.tags } : {}),
+      };
+      return Object.keys(row).length ? [row] : [];
+    }),
   };
 }
 export function resultIds(items: RecallResultItem[]): string[] {
